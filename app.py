@@ -2,6 +2,7 @@ import os
 import uuid
 import glob
 import json
+import signal
 import subprocess
 import threading
 from flask import Flask, request, jsonify, send_file, render_template
@@ -29,11 +30,58 @@ def parse_ytdlp_json(stdout):
     raise ValueError("yt-dlp returned no data")
 
 
+PROGRESS_PREFIX = "RECLIP|"
+PROGRESS_TEMPLATE = (
+    "download:" + PROGRESS_PREFIX
+    + "%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
+    "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
+)
+
+
+def to_num(value):
+    try:
+        return float(value)
+    except ValueError:
+        return None  # yt-dlp prints "NA" for unknown fields
+
+
+def track_output(job, line):
+    """Update a job's progress fields from one line of yt-dlp output."""
+    if line.startswith(PROGRESS_PREFIX):
+        done, total, estimate, speed, eta = map(to_num, line[len(PROGRESS_PREFIX):].split("|"))
+        total = total or estimate
+        job["percent"] = min(done / total * 100, 100) if done is not None and total else None
+        job["speed"] = speed
+        job["eta"] = eta
+    elif line.startswith("[download] Destination:"):
+        # Video+audio downloads fetch two streams one after the other.
+        job["part"] = job.get("part", 0) + 1
+        job["stage"] = "downloading"
+        job["percent"] = None
+    elif line.startswith("[Merger]"):
+        job["stage"] = "merging"
+    elif line.startswith("[ExtractAudio]"):
+        job["stage"] = "converting"
+
+
+def kill_job(job):
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd = [
+        "yt-dlp", "--no-playlist", "--newline",
+        "--progress-template", PROGRESS_TEMPLATE,
+        "-o", out_template,
+    ]
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -45,10 +93,33 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
+        # Own process group so a stop also kills the ffmpeg children yt-dlp spawns.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True
+        )
+        job["proc"] = proc
+        if job.get("cancelled"):
+            kill_job(job)
+        timer = threading.Timer(300, kill_job, args=(job,))
+        timer.start()
+        last_line = ""
+        for line in proc.stdout:
+            line = line.strip()
+            track_output(job, line)
+            if line and not line.startswith(PROGRESS_PREFIX):
+                last_line = line
+        proc.wait()
+        timer.cancel()
+        if job.get("cancelled"):
+            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+                os.remove(f)
+            job["status"] = "cancelled"
+            return
+        if proc.returncode == -signal.SIGKILL:
+            raise subprocess.TimeoutExpired(cmd, 300)
+        if proc.returncode != 0:
             job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
+            job["error"] = last_line
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
@@ -193,7 +264,23 @@ def check_status(job_id):
         "status": job["status"],
         "error": job.get("error"),
         "filename": job.get("filename"),
+        "stage": job.get("stage"),
+        "part": job.get("part"),
+        "percent": job.get("percent"),
+        "speed": job.get("speed"),
+        "eta": job.get("eta"),
     })
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def cancel_download(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    if job["status"] == "downloading":
+        job["cancelled"] = True
+        kill_job(job)
+    return jsonify({"status": job["status"]})
 
 
 @app.route("/api/file/<job_id>")
